@@ -194,3 +194,46 @@ def update_account_snapshots_table(account_id: str, balance: float, available_ba
                           account_id=account_id,
                           error=str(e))
             raise
+
+def get_todays_transactions() -> list[dict]:
+    """
+    Get all transactions from today
+    
+    Returns:
+        List of transaction dictionaries
+    """
+    with logfire.span('db.get_todays_transactions'):
+        logfire.info('Fetching today\'s transactions')
+        
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT 
+                            a.name as account_name,
+                            t.amount,
+                            t.description,
+                            t.payee,
+                            t.memo,
+                            t.transacted_at,
+                            t.pending
+                        FROM transactions t
+                        JOIN accounts a ON t.account_id = a.id
+                        WHERE DATE(t.transacted_at) = CURRENT_DATE - INTERVAL '1 day'
+                        ORDER BY t.transacted_at DESC
+                    """)
+                
+                    columns = [desc[0] for desc in cur.description]
+                    transactions = []
+                    
+                    for row in cur.fetchall():
+                        txn = dict(zip(columns, row))
+                        transactions.append(txn)
+                    
+                    logfire.info('Fetched today\'s transactions', 
+                                 count=len(transactions))
+                    return transactions
+        except Exception as e:
+            logfire.error('Failed to fetch today\'s transactions', 
+                          error=str(e))
+            raise
