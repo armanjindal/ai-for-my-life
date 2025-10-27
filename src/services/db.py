@@ -4,6 +4,10 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 import os
 import logfire
+from pydantic_ai import ModelMessagesTypeAdapter
+from pydantic_core import to_jsonable_python
+import uuid
+import json
 
 load_dotenv()
 logfire.configure()
@@ -30,8 +34,6 @@ def test_connection():
             accounts = cur.fetchall()
             for account in accounts:
                 print(account)
-
-test_connection()
 
 def update_accounts_table(account_id: str, name: str, currency: str, balance: float, available_balance: float, balance_date: int)->int:
     """
@@ -236,4 +238,318 @@ def get_todays_transactions() -> list[dict]:
         except Exception as e:
             logfire.error('Failed to fetch today\'s transactions', 
                           error=str(e))
+            raise
+
+def get_transactions_for_period(days: int) -> list[dict]:
+    """
+    Get transactions for the last N days
+    
+    Args:
+        days: Number of days to look back (e.g., 1 for today, 7 for last week)
+        
+    Returns:
+        List of transaction dictionaries with account name, amount, description, etc.
+    """
+    with logfire.span('db.get_transactions_for_period', days=days):
+        logfire.info('Fetching transactions for period', days=days)
+        
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    # Use parameterized query with interval calculation
+                    cur.execute("""
+                        SELECT 
+                            a.name as account_name,
+                            t.amount,
+                            t.description,
+                            t.payee,
+                            t.memo,
+                            t.transacted_at,
+                            t.pending
+                        FROM transactions t
+                        JOIN accounts a ON t.account_id = a.id
+                        WHERE t.transacted_at >= CURRENT_DATE - (INTERVAL '1 day' * %s)
+                        ORDER BY t.transacted_at DESC
+                    """, (days,))
+                
+                    columns = [desc[0] for desc in cur.description]
+                    transactions = []
+                    
+                    for row in cur.fetchall():
+                        txn = dict(zip(columns, row))
+                        # Format the datetime as string for JSON serialization
+                        if txn.get('transacted_at'):
+                            txn['transacted_at'] = txn['transacted_at'].isoformat()
+                        transactions.append(txn)
+                    
+                    logfire.info('Fetched transactions for period', 
+                                 days=days,
+                                 count=len(transactions))
+                    return transactions
+        except Exception as e:
+            logfire.error('Failed to fetch transactions for period', 
+                          days=days,
+                          error=str(e))
+            raise
+    
+# Saving chat history 
+def create_chat_session(user_id: str, title: str = None, metadata: dict = None) -> str:
+    """
+    Create a new chat session
+    
+    Args:
+        user_id: User ID who owns this session
+        title: Optional session title
+        metadata: Optional metadata (e.g., financial goals, agent config)
+        
+    Returns:
+        session_id as string
+    """
+    with logfire.span('db.create_chat_session', user_id=user_id):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    session_id = str(uuid.uuid4())
+                    
+                    cur.execute("""
+                        INSERT INTO chat_sessions (session_id, user_id, title, metadata, model)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING session_id
+                    """, (
+                        session_id,
+                        user_id,
+                        title or "New Conversation",
+                        json.dumps(metadata) if metadata else None,
+                        "anthropic:claude-3-5-haiku-20241022"  # Default model
+                    ))
+                    
+                    result = cur.fetchone()
+                    logfire.info('Created chat session', 
+                                session_id=result[0],
+                                user_id=user_id)
+                    return result[0]
+        except Exception as e:
+            logfire.error('Failed to create chat session', 
+                         user_id=user_id, 
+                         error=str(e))
+            raise
+
+
+def save_messages(session_id: str, messages: list) -> int:
+    """
+    Save new messages to the database
+    
+    Args:
+        session_id: The session these messages belong to
+        messages: List of ModelMessage objects from result.new_messages()
+        
+    Returns:
+        Number of messages saved
+    """
+    with logfire.span('db.save_messages', session_id=session_id):
+        logfire.info('Saving messages', 
+                    session_id=session_id, 
+                    count=len(messages))
+        
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    count = 0
+                    last_content = None
+                    
+                    for message in messages:
+                        # Convert ModelMessage to JSON-serializable dict
+                        message_json = to_jsonable_python(message)
+                        
+                        # Extract kind directly from Pydantic AI message (request or response)
+                        kind = message_json.get('kind', 'request')
+                        
+                        # Extract text content from parts for search/display
+                        content = ""
+                        if 'parts' in message_json:
+                            for part in message_json['parts']:
+                                if isinstance(part, dict) and 'content' in part:
+                                    content += str(part['content']) + " "
+                                elif isinstance(part, str):
+                                    content += part + " "
+                        
+                        content = content.strip() or "No text content"
+                        last_content = content
+                        
+                        # Insert message with native Pydantic AI structure
+                        cur.execute("""
+                            INSERT INTO chat_messages (
+                                session_id, 
+                                kind, 
+                                content, 
+                                full_message_data
+                            )
+                            VALUES (%s, %s, %s, %s)
+                        """, (
+                            session_id,
+                            kind,
+                            content,
+                            json.dumps(message_json)
+                        ))
+                        count += 1
+                    
+                    # Update session's updated_at and preview_text
+                    if last_content:
+                        preview = last_content[:200]  # First 200 chars
+                        cur.execute("""
+                            UPDATE chat_sessions 
+                            SET updated_at = NOW(),
+                                preview_text = %s
+                            WHERE session_id = %s
+                        """, (preview, session_id))
+                    
+                    logfire.info('Messages saved', 
+                                session_id=session_id, 
+                                count=count)
+                    return count
+        except Exception as e:
+            logfire.error('Failed to save messages', 
+                         session_id=session_id,
+                         error=str(e))
+            raise
+
+def load_messages(session_id: str) -> list:
+    """
+    Load all messages for a session from the database
+    
+    Args:
+        session_id: The session ID to load
+        
+    Returns:
+        List of ModelMessage objects validated from the stored JSON
+    """
+    with logfire.span('db.load_messages', session_id=session_id):
+        logfire.info('Loading messages', session_id=session_id)
+        
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT full_message_data 
+                        FROM chat_messages 
+                        WHERE session_id = %s AND NOT deleted
+                        ORDER BY created_at ASC
+                    """, (session_id,))
+                    
+                    rows = cur.fetchall()
+                    
+                    # Collect all message JSONs
+                    messages_json = [row[0] for row in rows]  # JSONB automatically parsed to dict
+                    
+                    # Validate the entire list at once using ModelMessagesTypeAdapter
+                    # This adapter expects a LIST of messages, not individual messages
+                    messages = ModelMessagesTypeAdapter.validate_python(messages_json)
+                    
+                    logfire.info('Loaded messages', 
+                                session_id=session_id,
+                                count=len(messages))
+                    return messages
+        except Exception as e:
+            logfire.error('Failed to load messages', 
+                         session_id=session_id,
+                         error=str(e))
+            raise
+
+
+def get_user_sessions(user_id: str, limit: int = 20, offset: int = 0, archived: bool = False) -> list[dict]:
+    """
+    Get list of user's chat sessions
+    
+    Args:
+        user_id: User ID
+        limit: Max sessions to return
+        offset: Pagination offset
+        archived: Include archived sessions
+        
+    Returns:
+        List of session dictionaries
+    """
+    with logfire.span('db.get_user_sessions', user_id=user_id):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT 
+                            cs.session_id,
+                            cs.title,
+                            cs.preview_text,
+                            cs.model,
+                            cs.created_at,
+                            cs.updated_at,
+                            cs.archived,
+                            COUNT(cm.id) as message_count
+                        FROM chat_sessions cs
+                        LEFT JOIN chat_messages cm 
+                            ON cs.session_id = cm.session_id AND NOT cm.deleted
+                        WHERE cs.user_id = %s AND cs.archived = %s
+                        GROUP BY cs.session_id
+                        ORDER BY cs.updated_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, archived, limit, offset))
+                    
+                    columns = [desc[0] for desc in cur.description]
+                    sessions = []
+                    
+                    for row in cur.fetchall():
+                        session = dict(zip(columns, row))
+                        # Convert datetime to ISO string
+                        session['created_at'] = session['created_at'].isoformat()
+                        session['updated_at'] = session['updated_at'].isoformat()
+                        sessions.append(session)
+                    
+                    logfire.info('Fetched user sessions', 
+                                user_id=user_id,
+                                count=len(sessions))
+                    return sessions
+        except Exception as e:
+            logfire.error('Failed to fetch user sessions', 
+                         user_id=user_id,
+                         error=str(e))
+            raise
+
+
+def update_session_title(session_id: str, title: str) -> bool:
+    """
+    Update session title
+    
+    Args:
+        session_id: Session to update
+        title: New title
+        
+    Returns:
+        True if successful
+    """
+    with logfire.span('db.update_session_title', session_id=session_id):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE chat_sessions 
+                        SET title = %s, updated_at = NOW()
+                        WHERE session_id = %s
+                    """, (title, session_id))
+                    
+                    return cur.rowcount > 0
+        except Exception as e:
+            logfire.error('Failed to update session title', error=str(e))
+            raise
+
+def create_user(name: str, email: str) -> str:
+    with logfire.span('db.create_user', name=name, email=email):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    result = cur.execute("""
+                        INSERT INTO users (name, email, created_at)
+                        VALUES (%s, %s, NOW())
+                        RETURNING id
+                    """, (name, email))
+                    return result
+        except Exception as e:
+            logfire.error('Failed to create user', error=str(e))
             raise
