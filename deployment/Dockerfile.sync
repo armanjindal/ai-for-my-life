@@ -16,6 +16,7 @@ COPY .logfire/ .logfire/
 COPY .env .env
 # Correct permissions and ensure newline
 RUN chmod 0644 /etc/cron.d/sync-cron && \
+    crontab /etc/cron.d/sync-cron && \
     touch /var/log/cron.log
 
 HEALTHCHECK --interval=5m --timeout=10s --start-period=30s \
