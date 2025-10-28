@@ -17,7 +17,8 @@ load_dotenv()
 
 SIMPLEFIN_ACCESS_URL = os.getenv('SIMPLEFIN_ACCESS_URL')
 
-
+if not SIMPLEFIN_ACCESS_URL:
+    raise ValueError("SIMPLEFIN_ACCESS_URL is not set")
 
 parsed_url = urlparse(SIMPLEFIN_ACCESS_URL)
 # parsed_url.netloc will be 'username:password@host'

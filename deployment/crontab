@@ -1,0 +1,7 @@
+# Set PATH so cron can find commands
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Run sync every 5 minutes (adjust as needed)
+0 2 * * * root cd /app && uv run python -m src.data-sync-scripts.simple-fin-chase-transactions >> /var/log/cron.log 2>&1
+
+# MUST have blank line at end!

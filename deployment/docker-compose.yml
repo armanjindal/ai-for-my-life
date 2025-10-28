@@ -1,0 +1,15 @@
+services:
+  data-sync:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.sync
+    env_file:
+      - ../.env  # Shared environment variables
+    restart: unless-stopped
+    container_name: finance-data-sync
+    # Add logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

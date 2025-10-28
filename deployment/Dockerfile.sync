@@ -1,0 +1,25 @@
+FROM python:3.14-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y cron procps && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml uv.lock ./
+RUN pip install uv && uv sync --frozen
+
+COPY src/ ./src/
+COPY deployment/crontab /etc/cron.d/sync-cron
+
+# Copy logfire folder to authenticate with Logfire
+COPY .logfire/ .logfire/
+
+COPY .env .env
+# Correct permissions and ensure newline
+RUN chmod 0644 /etc/cron.d/sync-cron && \
+    touch /var/log/cron.log
+
+HEALTHCHECK --interval=5m --timeout=10s --start-period=30s \
+  CMD uv run python -m src.data-sync-scripts.db-health-check || exit 1
+
+# Run cron and tail the log
+CMD cron && tail -f /var/log/cron.log
