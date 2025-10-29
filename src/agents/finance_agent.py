@@ -5,12 +5,10 @@ import logfire
 from pydantic_core import to_jsonable_python
 
 from src.services.db import (
-    get_transactions_for_period,
-    create_chat_session, 
+    get_transactions_for_period, 
     save_messages, 
     load_messages,
-    get_user_sessions,
-    create_user
+    get_user_sessions
 )
 
 
